@@ -14,10 +14,12 @@ export interface PersistedRemoteBrowserState {
   pathByDestination: Record<string, string>;
   pageByKey: Record<string, number>;
   selectedDestinationId: string | null;
+  refreshedAt: Record<string, number>;
 }
 
 export const REMOTE_BROWSER_STORAGE_KEY = 'nodewarden.backup.remote-browser.v1';
 export const REMOTE_BROWSER_ITEMS_PER_PAGE = 10;
+export const REMOTE_BROWSER_REFRESH_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export const COMMON_TIME_ZONES = [
   'UTC',
@@ -51,7 +53,7 @@ export function detectBrowserTimeZone(): string {
 }
 
 function createLocalizedDestinationName(type: BackupDestinationType, index: number): string {
-  if (type === 'e3') return t('txt_backup_destination_name_default_e3', { index: String(index) });
+  if (type === 's3') return t('txt_backup_destination_name_default_s3', { index: String(index) });
   return t('txt_backup_destination_name_default_webdav', { index: String(index) });
 }
 
@@ -148,6 +150,7 @@ export function loadPersistedRemoteBrowserState(userId?: string | null): Persist
         pathByDestination: {},
         pageByKey: {},
         selectedDestinationId: null,
+        refreshedAt: {},
       };
     }
     const parsed = JSON.parse(raw) as Partial<PersistedRemoteBrowserState>;
@@ -156,6 +159,7 @@ export function loadPersistedRemoteBrowserState(userId?: string | null): Persist
       pathByDestination: parsed.pathByDestination && typeof parsed.pathByDestination === 'object' ? parsed.pathByDestination : {},
       pageByKey: parsed.pageByKey && typeof parsed.pageByKey === 'object' ? parsed.pageByKey : {},
       selectedDestinationId: typeof parsed.selectedDestinationId === 'string' ? parsed.selectedDestinationId : null,
+      refreshedAt: parsed.refreshedAt && typeof parsed.refreshedAt === 'object' ? parsed.refreshedAt as Record<string, number> : {},
     };
   } catch {
     return {
@@ -163,6 +167,7 @@ export function loadPersistedRemoteBrowserState(userId?: string | null): Persist
       pathByDestination: {},
       pageByKey: {},
       selectedDestinationId: null,
+      refreshedAt: {},
     };
   }
 }
@@ -181,7 +186,7 @@ export function invalidateRemoteBrowserCacheForDestination(
   cache: Record<string, RemoteBackupBrowserResponse>,
   pathByDestination: Record<string, string>,
   pageByKey: Record<string, number>
-): PersistedRemoteBrowserState {
+): Omit<PersistedRemoteBrowserState, 'refreshedAt'> {
   return {
     cache: Object.fromEntries(Object.entries(cache).filter(([key]) => !key.startsWith(`${destinationId}:`))),
     pathByDestination: Object.fromEntries(Object.entries(pathByDestination).filter(([key]) => key !== destinationId)),
@@ -207,6 +212,6 @@ export function getFirstVisibleDestinationId(settings: BackupSettings | null | u
 }
 
 export function getDestinationTypeLabel(type: BackupDestinationType): string {
-  if (type === 'e3') return t('txt_backup_protocol_e3');
+  if (type === 's3') return t('txt_backup_protocol_s3');
   return t('txt_backup_protocol_webdav');
 }

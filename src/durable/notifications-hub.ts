@@ -1,18 +1,43 @@
+import { DurableObject, waitUntil } from 'cloudflare:workers';
 import type { Env } from '../types';
+import { notifyMobilePush } from '../services/push-relay';
 
 const SIGNALR_RECORD_SEPARATOR = 0x1e;
 const SIGNALR_HANDSHAKE_ACK = new Uint8Array([0x7b, 0x7d, SIGNALR_RECORD_SEPARATOR]);
+const SIGNALR_UPDATE_TYPE_SYNC_CIPHER_UPDATE = 0;
+const SIGNALR_UPDATE_TYPE_SYNC_CIPHER_CREATE = 1;
+const SIGNALR_UPDATE_TYPE_SYNC_FOLDER_DELETE = 3;
+const SIGNALR_UPDATE_TYPE_SYNC_CIPHERS = 4;
 const SIGNALR_UPDATE_TYPE_SYNC_VAULT = 5;
+const SIGNALR_UPDATE_TYPE_SYNC_FOLDER_CREATE = 7;
+const SIGNALR_UPDATE_TYPE_SYNC_FOLDER_UPDATE = 8;
+const SIGNALR_UPDATE_TYPE_SYNC_CIPHER_DELETE = 9;
 const SIGNALR_UPDATE_TYPE_LOG_OUT = 11;
-const SIGNALR_UPDATE_TYPE_DEVICE_STATUS = 12;
-const SIGNALR_PING_INTERVAL_MS = 15_000;
+const SIGNALR_UPDATE_TYPE_SYNC_SEND_CREATE = 12;
+const SIGNALR_UPDATE_TYPE_SYNC_SEND_UPDATE = 13;
+const SIGNALR_UPDATE_TYPE_SYNC_SEND_DELETE = 14;
+const SIGNALR_UPDATE_TYPE_AUTH_REQUEST = 15;
+const SIGNALR_UPDATE_TYPE_AUTH_REQUEST_RESPONSE = 16;
+const SIGNALR_UPDATE_TYPE_BACKUP_RESTORE_PROGRESS = 102;
+const WEBSOCKET_CONNECTION_TOKEN_PREFIX = 'ws-token:';
+const WEBSOCKET_CONNECTION_TOKEN_TTL_MS = 60 * 1000;
 
 type HubProtocol = 'json' | 'messagepack';
+type HubKind = 'user' | 'anonymous-auth-request';
 
-interface ConnectionState {
+interface WsAttachment {
+  kind: HubKind;
+  userId: string | null;
+  authRequestId: string | null;
   handshakeComplete: boolean;
   protocol: HubProtocol;
   deviceIdentifier: string | null;
+}
+
+interface WebSocketConnectionToken {
+  userId: string;
+  deviceIdentifier: string | null;
+  expiresAt: number;
 }
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {
@@ -28,6 +53,12 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 
 function encodeUtf8(value: string): Uint8Array {
   return new TextEncoder().encode(value);
+}
+
+function decodeIncomingMessage(data: string | ArrayBuffer | ArrayBufferView): string {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(data));
+  return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
 }
 
 function encodeMsgPackInteger(value: number): Uint8Array {
@@ -127,80 +158,108 @@ function frameSignalRBinary(payload: Uint8Array): Uint8Array {
 }
 
 function buildSignalRJsonInvocation(
-  userId: string,
   updateType: number,
-  revisionDate: string,
-  contextId: string | null
+  payload: Record<string, unknown>,
+  contextId: string | null,
+  target: string = 'ReceiveMessage'
 ): string {
   return JSON.stringify({
     type: 1,
-    target: 'ReceiveMessage',
+    target,
     arguments: [
-      {
-        ContextId: contextId,
-        Type: updateType,
-        Payload: {
-          UserId: userId,
-          Date: revisionDate,
+        {
+          ContextId: contextId,
+          Type: updateType,
+          Payload: payload,
         },
-      },
-    ],
-  }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR);
-}
-
-function buildSignalRJsonPing(): string {
-  return JSON.stringify({ type: 6 }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR);
+      ],
+    }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR);
 }
 
 function buildSignalRMessagePackInvocation(
-  userId: string,
   updateType: number,
-  revisionDate: string,
-  contextId: string | null
+  messagePayload: Record<string, unknown>,
+  contextId: string | null,
+  target: string = 'ReceiveMessage'
 ): Uint8Array {
   // SignalR MessagePack hub protocol uses an array-based invocation shape:
-  // [type, headers, invocationId, target, arguments]
-  const payload = encodeMsgPack([
+  // [type, headers, invocationId, target, arguments, streamIds]
+  const encodedPayload = encodeMsgPack([
     1,
     {},
     null,
-    'ReceiveMessage',
+    target,
     [
       {
         ContextId: contextId,
         Type: updateType,
-        Payload: {
-          UserId: userId,
-          Date: new Date(revisionDate),
-        },
+        Payload: messagePayload,
       },
     ],
+    [],
   ]);
-  return frameSignalRBinary(payload);
+  return frameSignalRBinary(encodedPayload);
 }
 
-function buildSignalRMessagePackPing(): Uint8Array {
-  return frameSignalRBinary(encodeMsgPack([6]));
-}
-
-function decodeIncomingMessage(data: string | ArrayBuffer | ArrayBufferView): string {
-  if (typeof data === 'string') return data;
-  if (data instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(data));
-  return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-}
-
-export class NotificationsHub {
-  private readonly connections = new Map<WebSocket, ConnectionState>();
-  private userId = '';
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(private readonly state: DurableObjectState, private readonly env: Env) {
-    void this.state;
-    void this.env;
+export class NotificationsHub extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair(
+        JSON.stringify({ type: 6 }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR),
+        JSON.stringify({ type: 6 }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR)
+      )
+    );
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === '/internal/ws-token' && request.method === 'POST') {
+      const body = (await request.json().catch(() => null)) as {
+        token?: string;
+        userId?: string;
+        deviceIdentifier?: string | null;
+        expiresAt?: number;
+      } | null;
+      const token = String(body?.token || '').trim();
+      const userId = String(body?.userId || '').trim();
+      const expiresAt = Number(body?.expiresAt || 0);
+      if (!token || !userId || expiresAt <= Date.now() || expiresAt > Date.now() + WEBSOCKET_CONNECTION_TOKEN_TTL_MS) {
+        return new Response('Invalid websocket connection token', { status: 400 });
+      }
+      await this.ctx.storage.put(`${WEBSOCKET_CONNECTION_TOKEN_PREFIX}${token}`, {
+        userId,
+        deviceIdentifier: String(body?.deviceIdentifier || '').trim() || null,
+        expiresAt,
+      } satisfies WebSocketConnectionToken);
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      if (currentAlarm === null || expiresAt < currentAlarm) {
+        await this.ctx.storage.setAlarm(expiresAt);
+      }
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === '/internal/ws-token/consume' && request.method === 'POST') {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null;
+      const token = String(body?.token || '').trim();
+      if (!token) return new Response('Invalid websocket connection token', { status: 400 });
+
+      // Delete inside a transaction so a connection ticket cannot win two concurrent upgrades.
+      const connection = await this.ctx.storage.transaction(async (txn) => {
+        const key = `${WEBSOCKET_CONNECTION_TOKEN_PREFIX}${token}`;
+        const stored = await txn.get<WebSocketConnectionToken>(key);
+        if (stored) await txn.delete(key);
+        return stored || null;
+      });
+      if (!connection || connection.expiresAt <= Date.now()) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      return new Response(JSON.stringify(connection), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
 
     if (url.pathname === '/internal/notify' && request.method === 'POST') {
       const body = (await request.json().catch(() => null)) as {
@@ -209,13 +268,36 @@ export class NotificationsHub {
         contextId?: string | null;
         updateType?: number;
         targetDeviceIdentifier?: string | null;
+        payload?: Record<string, unknown> | null;
       } | null;
       const revisionDate = String(body?.revisionDate || '').trim() || new Date().toISOString();
-      this.userId = String(request.headers.get('X-NodeWarden-UserId') || body?.userId || this.userId).trim();
+      const userId = String(request.headers.get('X-NodeWarden-UserId') || body?.userId || '').trim();
       const contextId = String(body?.contextId || '').trim() || null;
-      const updateType = Number(body?.updateType || SIGNALR_UPDATE_TYPE_SYNC_VAULT) || SIGNALR_UPDATE_TYPE_SYNC_VAULT;
+      const rawUpdateType = body?.updateType;
+      const parsedUpdateType = typeof rawUpdateType === 'number' ? rawUpdateType : Number(rawUpdateType);
+      const updateType = Number.isFinite(parsedUpdateType) ? parsedUpdateType : SIGNALR_UPDATE_TYPE_SYNC_VAULT;
       const targetDeviceIdentifier = String(body?.targetDeviceIdentifier || '').trim() || null;
-      this.broadcastMessage(updateType, revisionDate, contextId, targetDeviceIdentifier);
+      const payload = body?.payload && typeof body.payload === 'object'
+        ? body.payload
+        : {
+          UserId: userId,
+          Date: revisionDate,
+        };
+      this.broadcastMessage(updateType, payload, contextId, targetDeviceIdentifier);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === '/internal/auth-request-response' && request.method === 'POST') {
+      const body = (await request.json().catch(() => null)) as {
+        userId?: string;
+        authRequestId?: string;
+        contextId?: string | null;
+      } | null;
+      const userId = String(body?.userId || '').trim();
+      const authRequestId = String(body?.authRequestId || '').trim();
+      if (!userId || !authRequestId) return new Response('Invalid auth request notification', { status: 400 });
+
+      this.broadcastAuthRequestResponse(userId, authRequestId, String(body?.contextId || '').trim() || null);
       return new Response(null, { status: 204 });
     }
 
@@ -228,7 +310,7 @@ export class NotificationsHub {
       });
     }
 
-    if (url.pathname !== '/notifications/hub') {
+    if (url.pathname !== '/notifications/hub' && url.pathname !== '/notifications/anonymous-hub') {
       return new Response('Not found', { status: 404 });
     }
 
@@ -238,46 +320,34 @@ export class NotificationsHub {
 
     const requestUserId = String(url.searchParams.get('nw_uid') || '').trim();
     const requestDeviceIdentifier = String(url.searchParams.get('nw_did') || '').trim() || null;
-    if (requestUserId) {
-      this.userId = requestUserId;
-    }
+    const requestAuthRequestId = String(url.searchParams.get('nw_auth_request_id') || '').trim() || null;
+    const isAnonymousAuthRequestHub = url.pathname === '/notifications/anonymous-hub';
 
-    if (!this.userId) {
+    if (!isAnonymousAuthRequestHub && !requestUserId) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    if (isAnonymousAuthRequestHub && !requestAuthRequestId) {
       return new Response('Unauthorized', { status: 401 });
     }
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    server.accept();
 
-    this.connections.set(server, {
+    const tags: string[] = [];
+    if (requestDeviceIdentifier) {
+      tags.push(`device:${requestDeviceIdentifier}`);
+    }
+    this.ctx.acceptWebSocket(server, tags);
+
+    server.serializeAttachment({
+      kind: isAnonymousAuthRequestHub ? 'anonymous-auth-request' : 'user',
+      userId: isAnonymousAuthRequestHub ? null : requestUserId,
+      authRequestId: requestAuthRequestId,
       handshakeComplete: false,
       protocol: 'messagepack',
       deviceIdentifier: requestDeviceIdentifier,
-    });
-    this.ensurePingLoop();
-
-    server.addEventListener('message', (event) => {
-      void this.handleSocketMessage(server, event.data);
-    });
-    server.addEventListener('close', () => {
-      const shouldBroadcast = !!this.connections.get(server)?.handshakeComplete;
-      this.connections.delete(server);
-      this.stopPingLoopIfIdle();
-      if (shouldBroadcast) this.broadcastDeviceStatus();
-    });
-    server.addEventListener('error', () => {
-      const shouldBroadcast = !!this.connections.get(server)?.handshakeComplete;
-      this.connections.delete(server);
-      this.stopPingLoopIfIdle();
-      if (shouldBroadcast) this.broadcastDeviceStatus();
-      try {
-        server.close(1011, 'Socket error');
-      } catch {
-        // ignore close races
-      }
-    });
+    } satisfies WsAttachment);
 
     return new Response(null, {
       status: 101,
@@ -285,21 +355,41 @@ export class NotificationsHub {
     });
   }
 
-  private async handleSocketMessage(socket: WebSocket, rawData: string | ArrayBuffer | ArrayBufferView): Promise<void> {
-    const connection = this.connections.get(socket);
-    if (!connection) return;
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const tokens = await this.ctx.storage.list<WebSocketConnectionToken>({
+      prefix: WEBSOCKET_CONNECTION_TOKEN_PREFIX,
+    });
+    const expiredKeys: string[] = [];
+    let nextExpiration: number | null = null;
 
-    if (!connection.handshakeComplete) {
-      const text = decodeIncomingMessage(rawData);
+    for (const [key, token] of tokens) {
+      if (token.expiresAt <= now) {
+        expiredKeys.push(key);
+      } else if (nextExpiration === null || token.expiresAt < nextExpiration) {
+        nextExpiration = token.expiresAt;
+      }
+    }
+
+    // Negotiated tickets that never reach an upgrade must not remain in DO storage indefinitely.
+    if (expiredKeys.length > 0) await this.ctx.storage.delete(expiredKeys);
+    if (nextExpiration !== null) await this.ctx.storage.setAlarm(nextExpiration);
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer | ArrayBufferView): Promise<void> {
+    const attachment = ws.deserializeAttachment() as WsAttachment | null;
+    if (!attachment) return;
+
+    if (!attachment.handshakeComplete) {
+      const text = decodeIncomingMessage(message);
       const frames = text.split(String.fromCharCode(SIGNALR_RECORD_SEPARATOR)).filter(Boolean);
       for (const frame of frames) {
         try {
           const handshake = JSON.parse(frame) as { protocol?: string };
-          const protocol = handshake.protocol === 'json' ? 'json' : 'messagepack';
-          connection.protocol = protocol;
-          connection.handshakeComplete = true;
-          socket.send(SIGNALR_HANDSHAKE_ACK);
-          this.broadcastDeviceStatus();
+          attachment.protocol = handshake.protocol === 'json' ? 'json' : 'messagepack';
+          attachment.handshakeComplete = true;
+          ws.serializeAttachment(attachment);
+          ws.send(SIGNALR_HANDSHAKE_ACK);
           return;
         } catch {
           // Ignore malformed pre-handshake payloads.
@@ -307,107 +397,363 @@ export class NotificationsHub {
       }
       return;
     }
-  }
 
-  private ensurePingLoop(): void {
-    if (this.pingTimer !== null) return;
-    this.pingTimer = setInterval(() => {
-      this.broadcastPing();
-    }, SIGNALR_PING_INTERVAL_MS);
-  }
-
-  private stopPingLoopIfIdle(): void {
-    if (this.connections.size > 0 || this.pingTimer === null) return;
-    clearInterval(this.pingTimer);
-    this.pingTimer = null;
-  }
-
-  private broadcastPing(): void {
-    if (this.connections.size === 0) {
-      this.stopPingLoopIfIdle();
-      return;
-    }
-
-    for (const [socket, connection] of this.connections) {
-      if (!connection.handshakeComplete) continue;
+    if (typeof message !== 'string') {
       try {
-        if (connection.protocol === 'json') {
-          socket.send(buildSignalRJsonPing());
-        } else {
-          socket.send(buildSignalRMessagePackPing());
-        }
+        ws.send(message);
       } catch {
-        this.connections.delete(socket);
-        try {
-          socket.close(1011, 'Ping send failed');
-        } catch {
-          // ignore close races
-        }
+        // ignore send errors on echo
       }
     }
+  }
 
-    this.stopPingLoopIfIdle();
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
+    void ws;
+    void code;
+    void reason;
+    void wasClean;
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    void ws;
+    void error;
   }
 
   private getOnlineDeviceIdentifiers(): string[] {
     const out = new Set<string>();
-    for (const connection of this.connections.values()) {
-      if (!connection.handshakeComplete || !connection.deviceIdentifier) continue;
-      out.add(connection.deviceIdentifier);
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as WsAttachment | null;
+      if (!attachment?.handshakeComplete || attachment.kind !== 'user' || !attachment.deviceIdentifier) continue;
+      out.add(attachment.deviceIdentifier);
     }
     return Array.from(out);
   }
 
   private broadcastMessage(
     updateType: number,
-    revisionDate: string,
+    payload: Record<string, unknown>,
     contextId: string | null,
     targetDeviceIdentifier: string | null
   ): void {
-    if (!this.userId || this.connections.size === 0) return;
+    const sockets = targetDeviceIdentifier
+      ? this.ctx.getWebSockets(`device:${targetDeviceIdentifier}`)
+      : this.ctx.getWebSockets();
 
-    for (const [socket, connection] of this.connections) {
-      if (!connection.handshakeComplete) continue;
-      if (targetDeviceIdentifier && connection.deviceIdentifier !== targetDeviceIdentifier) continue;
+    if (sockets.length === 0) return;
+
+    for (const ws of sockets) {
+      const attachment = ws.deserializeAttachment() as WsAttachment | null;
+      if (!attachment?.handshakeComplete) continue;
       try {
-        if (connection.protocol === 'json') {
-          socket.send(buildSignalRJsonInvocation(this.userId, updateType, revisionDate, contextId));
+        if (attachment.protocol === 'json') {
+          ws.send(buildSignalRJsonInvocation(updateType, payload, contextId));
         } else {
-          socket.send(buildSignalRMessagePackInvocation(this.userId, updateType, revisionDate, contextId));
+          ws.send(buildSignalRMessagePackInvocation(updateType, payload, contextId));
         }
       } catch {
-        this.connections.delete(socket);
         try {
-          socket.close(1011, 'Notification send failed');
+          ws.close(1011, 'Notification send failed');
         } catch {
           // ignore close races
         }
       }
     }
-
-    this.stopPingLoopIfIdle();
   }
 
-  private broadcastDeviceStatus(): void {
-    this.broadcastMessage(SIGNALR_UPDATE_TYPE_DEVICE_STATUS, new Date().toISOString(), null, null);
+  private broadcastAuthRequestResponse(userId: string, authRequestId: string, contextId: string | null): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as WsAttachment | null;
+      if (
+        !attachment?.handshakeComplete ||
+        attachment.kind !== 'anonymous-auth-request' ||
+        attachment.authRequestId !== authRequestId
+      ) {
+        continue;
+      }
+
+      const payload = {
+        UserId: userId,
+        Id: authRequestId,
+      };
+      try {
+        if (attachment.protocol === 'json') {
+          ws.send(buildSignalRJsonInvocation(
+            SIGNALR_UPDATE_TYPE_AUTH_REQUEST_RESPONSE,
+            payload,
+            contextId,
+            'AuthRequestResponseRecieved'
+          ));
+        } else {
+          ws.send(buildSignalRMessagePackInvocation(
+            SIGNALR_UPDATE_TYPE_AUTH_REQUEST_RESPONSE,
+            payload,
+            contextId,
+            'AuthRequestResponseRecieved'
+          ));
+        }
+      } catch {
+        try {
+          ws.close(1011, 'Notification send failed');
+        } catch {
+          // ignore close races
+        }
+      }
+    }
   }
 }
 
-export async function notifyUserVaultSync(
+export function notifyUserVaultSync(
   env: Env,
   userId: string,
   revisionDate: string,
   contextId?: string | null
-): Promise<void> {
-  return notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_SYNC_VAULT, revisionDate, contextId ?? null, null);
+): void {
+  waitUntil(notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_SYNC_VAULT, revisionDate, contextId ?? null, null));
 }
 
-export async function notifyUserLogout(
+export function notifyUserCiphersSync(
+  env: Env,
+  userId: string,
+  revisionDate: string,
+  contextId?: string | null
+): void {
+  waitUntil(notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_SYNC_CIPHERS, revisionDate, contextId ?? null, null));
+}
+
+export function notifyUserCipherCreate(
+  env: Env,
+  payload: {
+    userId: string;
+    cipherId: string;
+    revisionDate: string;
+    organizationId?: string | null;
+    collectionIds?: string[] | null;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_CIPHER_CREATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.cipherId,
+      OrganizationId: payload.organizationId ?? null,
+      CollectionIds: Array.isArray(payload.collectionIds) ? payload.collectionIds : null,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserCipherUpdate(
+  env: Env,
+  payload: {
+    userId: string;
+    cipherId: string;
+    revisionDate: string;
+    organizationId?: string | null;
+    collectionIds?: string[] | null;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_CIPHER_UPDATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.cipherId,
+      OrganizationId: payload.organizationId ?? null,
+      CollectionIds: Array.isArray(payload.collectionIds) ? payload.collectionIds : null,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserCipherDelete(
+  env: Env,
+  payload: {
+    userId: string;
+    cipherId: string;
+    revisionDate: string;
+    organizationId?: string | null;
+    collectionIds?: string[] | null;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_CIPHER_DELETE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.cipherId,
+      OrganizationId: payload.organizationId ?? null,
+      CollectionIds: Array.isArray(payload.collectionIds) ? payload.collectionIds : null,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserFolderCreate(
+  env: Env,
+  payload: {
+    userId: string;
+    folderId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_FOLDER_CREATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.folderId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserFolderUpdate(
+  env: Env,
+  payload: {
+    userId: string;
+    folderId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_FOLDER_UPDATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.folderId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserFolderDelete(
+  env: Env,
+  payload: {
+    userId: string;
+    folderId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_FOLDER_DELETE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.folderId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserSendCreate(
+  env: Env,
+  payload: {
+    userId: string;
+    sendId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_SEND_CREATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.sendId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserSendUpdate(
+  env: Env,
+  payload: {
+    userId: string;
+    sendId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_SEND_UPDATE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.sendId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserSendDelete(
+  env: Env,
+  payload: {
+    userId: string;
+    sendId: string;
+    revisionDate: string;
+    contextId?: string | null;
+  }
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    payload.userId,
+    SIGNALR_UPDATE_TYPE_SYNC_SEND_DELETE,
+    payload.revisionDate,
+    payload.contextId ?? null,
+    null,
+    {
+      UserId: payload.userId,
+      Id: payload.sendId,
+      RevisionDate: payload.revisionDate,
+    }
+  ));
+}
+
+export function notifyUserLogout(
   env: Env,
   userId: string,
   targetDeviceIdentifier?: string | null
-): Promise<void> {
-  return notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_LOG_OUT, new Date().toISOString(), null, targetDeviceIdentifier ?? null);
+): void {
+  waitUntil(notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_LOG_OUT, new Date().toISOString(), null, targetDeviceIdentifier ?? null));
 }
 
 export async function getOnlineUserDevices(env: Env, userId: string): Promise<string[]> {
@@ -423,13 +769,59 @@ export async function getOnlineUserDevices(env: Env, userId: string): Promise<st
   }
 }
 
+export async function notifyAuthRequestResponse(
+  env: Env,
+  userId: string,
+  authRequestId: string,
+  contextId?: string | null
+): Promise<void> {
+  try {
+    const id = env.NOTIFICATIONS_HUB.idFromName(authRequestId);
+    const stub = env.NOTIFICATIONS_HUB.get(id);
+    await stub.fetch('https://notifications/internal/auth-request-response', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        userId,
+        authRequestId,
+        contextId: contextId || null,
+      }),
+    });
+  } catch (error) {
+    console.error('Failed to broadcast auth request response notification:', error);
+  }
+}
+
+export function notifyUserAuthRequest(
+  env: Env,
+  userId: string,
+  authRequestId: string,
+  contextId?: string | null
+): void {
+  waitUntil(notifyUserUpdate(
+    env,
+    userId,
+    SIGNALR_UPDATE_TYPE_AUTH_REQUEST,
+    new Date().toISOString(),
+    contextId ?? null,
+    null,
+    {
+      UserId: userId,
+      Id: authRequestId,
+    }
+  ));
+}
+
 async function notifyUserUpdate(
   env: Env,
   userId: string,
   updateType: number,
   revisionDate: string,
   contextId: string | null,
-  targetDeviceIdentifier: string | null
+  targetDeviceIdentifier: string | null,
+  payloadOverride?: Record<string, unknown> | null
 ): Promise<void> {
   try {
     const id = env.NOTIFICATIONS_HUB.idFromName(userId);
@@ -445,9 +837,89 @@ async function notifyUserUpdate(
         contextId: contextId || null,
         updateType,
         targetDeviceIdentifier: targetDeviceIdentifier || null,
+        payload: payloadOverride || {
+          UserId: userId,
+          Date: revisionDate,
+        },
       }),
+    });
+    await notifyMobilePush(env, {
+      userId,
+      updateType,
+      revisionDate,
+      contextId,
+      payload: payloadOverride || {
+        UserId: userId,
+        Date: revisionDate,
+      },
     });
   } catch (error) {
     console.error('Failed to broadcast realtime notification:', error);
   }
+}
+
+export async function notifyUserBackupProgress(
+  env: Env,
+  userId: string,
+  progress: {
+    operation: 'backup-restore' | 'backup-export' | 'backup-remote-run';
+    source?: 'local' | 'remote';
+    step: string;
+    fileName: string;
+    stageTitle?: string;
+    stageDetail?: string;
+    replaceExisting?: boolean;
+    done?: boolean;
+    ok?: boolean;
+    error?: string | null;
+    timestamp?: string;
+  },
+  targetDeviceIdentifier?: string | null
+): Promise<void> {
+  const revisionDate = progress.timestamp || new Date().toISOString();
+  try {
+    const id = env.NOTIFICATIONS_HUB.idFromName(userId);
+    const stub = env.NOTIFICATIONS_HUB.get(id);
+    await stub.fetch('https://notifications/internal/notify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-NodeWarden-UserId': userId,
+      },
+      body: JSON.stringify({
+        revisionDate,
+        contextId: null,
+        updateType: SIGNALR_UPDATE_TYPE_BACKUP_RESTORE_PROGRESS,
+        targetDeviceIdentifier: targetDeviceIdentifier || null,
+        payload: {
+          UserId: userId,
+          Date: revisionDate,
+          ...progress,
+        },
+      }),
+    });
+  } catch (error) {
+    console.error('Failed to broadcast backup progress:', error);
+  }
+}
+
+export async function notifyUserBackupRestoreProgress(
+  env: Env,
+  userId: string,
+  progress: {
+    operation: 'backup-restore';
+    source: 'local' | 'remote';
+    step: string;
+    fileName: string;
+    stageTitle?: string;
+    stageDetail?: string;
+    replaceExisting?: boolean;
+    done?: boolean;
+    ok?: boolean;
+    error?: string | null;
+    timestamp?: string;
+  },
+  targetDeviceIdentifier?: string | null
+): Promise<void> {
+  return notifyUserBackupProgress(env, userId, progress, targetDeviceIdentifier);
 }

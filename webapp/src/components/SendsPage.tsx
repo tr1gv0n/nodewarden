@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
-import { CheckCheck, ChevronLeft, Copy, Eye, EyeOff, File, FileText, LayoutGrid, Pencil, Plus, RefreshCw, Save, Send as SendIcon, Trash2, X } from 'lucide-preact';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { CheckCheck, ChevronLeft, Copy, Eye, EyeOff, File, FileText, LayoutGrid, Lock, Pencil, Plus, RefreshCw, Save, Send as SendIcon, Trash2, X } from 'lucide-preact';
 import { copyTextToClipboard } from '@/lib/clipboard';
+import LoadingState from '@/components/LoadingState';
 import type { Send, SendDraft } from '@/lib/types';
 import { t } from '@/lib/i18n';
 
@@ -14,12 +15,13 @@ interface SendsPageProps {
   onBulkDelete: (ids: string[]) => Promise<void>;
   uploadingSendFileName: string;
   sendUploadPercent: number | null;
+  mobileSidebarToggleKey: number;
   onNotify: (type: 'success' | 'error', text: string) => void;
 }
 
 type SendTypeFilter = 'all' | 'text' | 'file';
 const AUTO_COPY_KEY = 'nodewarden.send.auto_copy_link.v1';
-const MOBILE_LAYOUT_QUERY = '(max-width: 900px)';
+const MOBILE_LAYOUT_QUERY = '(max-width: 1180px)';
 
 function daysFromNow(iso: string | null | undefined, fallback: number): string {
   if (!iso) return String(fallback);
@@ -28,6 +30,13 @@ function daysFromNow(iso: string | null | undefined, fallback: number): string {
   const diff = d - Date.now();
   const days = Math.ceil(diff / (24 * 60 * 60 * 1000));
   return String(Math.max(days, 0));
+}
+
+function formatSendDate(value: string | null | undefined): string {
+  if (!value) return t('txt_dash');
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return t('txt_dash');
+  return parsed.toLocaleString();
 }
 
 function buildDefaultDraft(): SendDraft {
@@ -41,6 +50,7 @@ function buildDefaultDraft(): SendDraft {
     expirationDays: '0',
     maxAccessCount: '',
     password: '',
+    hasPassword: false,
     disabled: false,
   };
 }
@@ -57,11 +67,16 @@ function draftFromSend(send: Send): SendDraft {
     expirationDays: daysFromNow(send.expirationDate, 0),
     maxAccessCount: send.maxAccessCount !== null && send.maxAccessCount !== undefined ? String(send.maxAccessCount) : '',
     password: '',
+    hasPassword: !!send.password,
     disabled: !!send.disabled,
   };
 }
 
 export default function SendsPage(props: SendsPageProps) {
+  const getInitialIsMobileLayout = () =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(MOBILE_LAYOUT_QUERY).matches
+      : false;
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<SendTypeFilter>('all');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -71,9 +86,10 @@ export default function SendsPage(props: SendsPageProps) {
   const [draft, setDraft] = useState<SendDraft | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
-  const [isMobileLayout, setIsMobileLayout] = useState(false);
+  const [isMobileLayout, setIsMobileLayout] = useState(getInitialIsMobileLayout);
   const [mobilePanel, setMobilePanel] = useState<'list' | 'detail' | 'edit'>('list');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const mobileSidebarToggleKeyRef = useRef(props.mobileSidebarToggleKey);
   const [autoCopyLink, setAutoCopyLink] = useState<boolean>(() => {
     try {
       return localStorage.getItem(AUTO_COPY_KEY) === '1';
@@ -103,12 +119,10 @@ export default function SendsPage(props: SendsPageProps) {
   }, []);
 
   useEffect(() => {
-    const onToggleSidebar = () => {
-      setMobileSidebarOpen((open) => !open);
-    };
-    window.addEventListener('nodewarden:toggle-sidebar', onToggleSidebar);
-    return () => window.removeEventListener('nodewarden:toggle-sidebar', onToggleSidebar);
-  }, []);
+    if (props.mobileSidebarToggleKey === mobileSidebarToggleKeyRef.current) return;
+    mobileSidebarToggleKeyRef.current = props.mobileSidebarToggleKey;
+    setMobileSidebarOpen((open) => !open);
+  }, [props.mobileSidebarToggleKey]);
 
   useEffect(() => {
     try {
@@ -219,14 +233,31 @@ export default function SendsPage(props: SendsPageProps) {
     }
   }
 
+  function getAccessUrl(send: Send): string {
+    const rawUrl = send.shareUrl || `/send/${send.accessId}`;
+    if (/^https?:\/\//i.test(rawUrl)) return rawUrl;
+    if (rawUrl.startsWith('/#/')) return `${window.location.origin}${rawUrl}`;
+    if (rawUrl.startsWith('#/')) return `${window.location.origin}/${rawUrl}`;
+    if (rawUrl.startsWith('/')) return `${window.location.origin}/#${rawUrl}`;
+    return `${window.location.origin}/#/${rawUrl.replace(/^\/+/, '')}`;
+  }
+
   function copyAccessUrl(send: Send): void {
-    const url = send.shareUrl || `${window.location.origin}/#/send/${send.accessId}`;
+    const url = getAccessUrl(send);
     void copyTextToClipboard(url, { successMessage: t('txt_link_copied') });
   }
 
   return (
     <div className={`vault-grid ${isMobileLayout ? `mobile-panel-${mobilePanel}` : ''}`}>
-      {isMobileLayout && mobileSidebarOpen && <div className="mobile-sidebar-mask" onClick={() => setMobileSidebarOpen(false)} />}
+      {isMobileLayout && (
+        <div
+          className={`mobile-sidebar-mask ${mobileSidebarOpen ? 'open' : ''}`}
+          onClick={() => {
+            if (!mobileSidebarOpen) return;
+            setMobileSidebarOpen(false);
+          }}
+        />
+      )}
       <aside className={`sidebar ${isMobileLayout ? 'mobile-sidebar-sheet' : ''} ${isMobileLayout && mobileSidebarOpen ? 'open' : ''}`}>
         {isMobileLayout && (
           <div className="mobile-sidebar-head">
@@ -310,12 +341,27 @@ export default function SendsPage(props: SendsPageProps) {
           </button>
         </div>
         <div className="list-panel">
-          {filteredSends.map((send) => (
-            <div key={send.id} className={`list-item ${selectedId === send.id ? 'active' : ''}`}>
+          {props.loading && !filteredSends.length && <LoadingState lines={6} compact />}
+          {filteredSends.map((send, index) => (
+            <div
+              key={send.id}
+              className={`list-item stagger-item stagger-delay-${Math.min(index, 10)} ${selectedId === send.id ? 'active' : ''}`}
+              onClick={(event) => {
+                const target = event.target as HTMLElement;
+                if (target.closest('.row-check')) return;
+                setSelectedId(send.id);
+                setIsEditing(false);
+                setIsCreating(false);
+                setDraft(null);
+                if (isMobileLayout) setMobilePanel('detail');
+                setMobileSidebarOpen(false);
+              }}
+            >
               <input
                 type="checkbox"
                 className="row-check"
                 checked={!!selectedMap[send.id]}
+                onClick={(event) => event.stopPropagation()}
                 onInput={(e) =>
                   setSelectedMap((prev) => ({
                     ...prev,
@@ -343,13 +389,14 @@ export default function SendsPage(props: SendsPageProps) {
                 <div className="list-text">
                   <span className="list-title" title={send.decName || t('txt_no_name')}>{send.decName || t('txt_no_name')}</span>
                   <span className="list-sub">
+                    {!!send.password && <><Lock size={12} className="inline-icon" /> </>}
                     {Number(send.type) === 1 ? t('txt_file') : t('txt_text')} - {t('txt_accessed_count_times', { count: send.accessCount || 0 })}
                   </span>
                 </div>
               </button>
             </div>
           ))}
-          {!filteredSends.length && <div className="empty">{t('txt_no_sends')}</div>}
+          {!props.loading && !filteredSends.length && <div className="empty">{t('txt_no_sends')}</div>}
         </div>
       </section>
 
@@ -377,10 +424,11 @@ export default function SendsPage(props: SendsPageProps) {
           </div>
         )}
         {isEditing && draft && (
-          <div className="card">
-            <h3 className="detail-title">{isCreating ? t('txt_new_send') : t('txt_edit_send')}</h3>
-            {!!props.uploadingSendFileName && <div className="detail-sub">{sendUploadLabel}</div>}
-            <div className="field-grid">
+          <div key={`send-editor-${draft.id || selectedSend?.id || 'new'}-${draft.type}`} className="detail-switch-stage">
+            <div className="card stagger-item stagger-delay-0">
+              <h3 className="detail-title">{isCreating ? t('txt_new_send') : t('txt_edit_send')}</h3>
+              {!!props.uploadingSendFileName && <div className="detail-sub">{sendUploadLabel}</div>}
+              <div className="field-grid">
               <label className="field field-span-2">
                 <span>{t('txt_name')}</span>
                 <input className="input" value={draft.name} onInput={(e) => setDraft({ ...draft, name: (e.currentTarget as HTMLInputElement).value })} />
@@ -433,12 +481,23 @@ export default function SendsPage(props: SendsPageProps) {
               </label>
               <label className="field">
                 <span>{t('txt_password')}</span>
-                <div className="password-wrap">
-                  <input className="input" type={showPassword ? 'text' : 'password'} value={draft.password} onInput={(e) => setDraft({ ...draft, password: (e.currentTarget as HTMLInputElement).value })} />
-                  <button type="button" className="password-toggle" onClick={() => setShowPassword((v) => !v)}>
-                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
+                {draft.hasPassword ? (
+                  <div className="password-wrap">
+                    <input className="input" type="password" value="••••••••" disabled />
+                    {!isCreating && (
+                      <button type="button" className="password-toggle text-red-600 hover:text-red-700" onClick={() => setDraft({ ...draft, hasPassword: false, password: '' })} title={t('txt_remove')}>
+                        <Trash2 size={16} />
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="password-wrap">
+                    <input className="input" type={showPassword ? 'text' : 'password'} value={draft.password} onInput={(e) => setDraft({ ...draft, password: (e.currentTarget as HTMLInputElement).value })} />
+                    <button type="button" className="password-toggle" onClick={() => setShowPassword((v) => !v)}>
+                      {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                )}
               </label>
               <label className="field field-span-2">
                 <span>{t('txt_notes')}</span>
@@ -451,8 +510,8 @@ export default function SendsPage(props: SendsPageProps) {
                   <label><input type="checkbox" checked={autoCopyLink} onInput={(e) => setAutoCopyLink((e.currentTarget as HTMLInputElement).checked)} /> {t('txt_auto_copy_link_after_save')}</label>
                 </div>
               </label>
-            </div>
-            <div className="detail-actions">
+              </div>
+              <div className="detail-actions">
               <button type="button" className="btn btn-primary small" disabled={busy} onClick={() => void saveDraft()}>
                 <Save size={14} className="btn-icon" /> {t('txt_save')}
               </button>
@@ -470,22 +529,23 @@ export default function SendsPage(props: SendsPageProps) {
               >
                 <X size={14} className="btn-icon" /> {t('txt_cancel')}
               </button>
+              </div>
             </div>
           </div>
         )}
 
         {!isEditing && selectedSend && (
-          <>
-            <div className="card">
+          <div key={`send-detail-${selectedSend.id}`} className="detail-switch-stage">
+            <div className="card stagger-item stagger-delay-1">
               <h3 className="detail-title">{selectedSend.decName || t('txt_no_name')}</h3>
               <div className="detail-sub">{Number(selectedSend.type) === 1 ? t('txt_file_send') : t('txt_text_send')}</div>
             </div>
 
-            <div className="card">
+            <div className="card stagger-item stagger-delay-2">
               <h4>{t('txt_send_details')}</h4>
               <div className="kv-line"><span>{t('txt_access_count')}</span><strong>{selectedSend.accessCount || 0}</strong></div>
-              <div className="kv-line"><span>{t('txt_deletion_date')}</span><strong>{selectedSend.deletionDate || t('txt_dash')}</strong></div>
-              <div className="kv-line"><span>{t('txt_expiration_date')}</span><strong>{selectedSend.expirationDate || t('txt_dash')}</strong></div>
+              <div className="kv-line"><span>{t('txt_deletion_date')}</span><strong>{formatSendDate(selectedSend.deletionDate)}</strong></div>
+              <div className="kv-line"><span>{t('txt_expiration_date')}</span><strong>{formatSendDate(selectedSend.expirationDate)}</strong></div>
             </div>
 
             <div className="card">
@@ -504,7 +564,7 @@ export default function SendsPage(props: SendsPageProps) {
             </div>
 
             {!!(selectedSend.decNotes || '').trim() && (
-              <div className="card">
+              <div className="card stagger-item stagger-delay-3">
                 <h4>{t('txt_notes')}</h4>
                 <div className="notes">{selectedSend.decNotes || ''}</div>
               </div>
@@ -515,7 +575,7 @@ export default function SendsPage(props: SendsPageProps) {
                 <button type="button" className="btn btn-secondary small" onClick={() => copyAccessUrl(selectedSend)}>
                   <Copy size={14} className="btn-icon" /> {t('txt_copy_link')}
                 </button>
-                <button type="button" className="btn btn-secondary small" onClick={() => { setDraft(draftFromSend(selectedSend)); setIsCreating(false); setIsEditing(true); }}>
+                <button type="button" className="btn btn-secondary small" onClick={() => { setDraft(draftFromSend(selectedSend)); setIsCreating(false); setIsEditing(true); setShowPassword(false); }}>
                   <Pencil size={14} className="btn-icon" /> {t('txt_edit')}
                 </button>
               </div>
@@ -523,8 +583,9 @@ export default function SendsPage(props: SendsPageProps) {
                 <Trash2 size={14} className="btn-icon" /> {t('txt_delete')}
               </button>
             </div>
-          </>
+          </div>
         )}
+        {!isEditing && !selectedSend && props.loading && <LoadingState card lines={4} />}
       </section>
     </div>
   );

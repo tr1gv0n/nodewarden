@@ -1,8 +1,25 @@
 import type { RefObject } from 'preact';
-import { CheckCheck, Download, Paperclip, Plus, RefreshCw, Star, StarOff, Trash2, Upload, X } from 'lucide-preact';
+import { createPortal } from 'preact/compat';
+import { ArrowDown, ArrowUp, CheckCheck, Download, Paperclip, Plus, QrCode, RefreshCw, Star, StarOff, Trash2, Upload, X } from 'lucide-preact';
+import jsQR from 'jsqr';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { useDialogLifecycle } from '@/components/ConfirmDialog';
+import { normalizeTotpInput } from '@/lib/crypto';
 import type { Cipher, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
-import { CREATE_TYPE_OPTIONS, cipherTypeLabel, formatAttachmentSize, toBooleanFieldValue } from '@/components/vault/vault-page-helpers';
+import { cardBrand } from '@/lib/import-format-shared';
+import {
+  CARD_BRAND_OPTIONS,
+  CardBrandIcon,
+  cipherTypeLabel,
+  createEmptyLoginUri,
+  formatAttachmentSize,
+  formatHistoryTime,
+  getCreateTypeOptions,
+  getWebsiteMatchOptions,
+  normalizeCardBrand,
+  toBooleanFieldValue,
+} from '@/components/vault/vault-page-helpers';
 
 interface VaultEditorProps {
   draft: VaultDraft;
@@ -24,6 +41,9 @@ interface VaultEditorProps {
   onSeedSshDefaults: (force?: boolean) => void;
   onUpdateSshPublicKey: (value: string) => void;
   onUpdateDraftLoginUri: (index: number, value: string) => void;
+  onUpdateDraftLoginUriMatch: (index: number, value: number | null) => void;
+  onReorderDraftLoginUri: (fromIndex: number, toIndex: number) => void;
+  onRequestDeleteLoginPasskey: (index: number) => void;
   onQueueAttachmentFiles: (list: FileList | null) => void;
   onToggleExistingAttachmentRemoval: (attachmentId: string) => void;
   onRemoveQueuedAttachment: (index: number) => void;
@@ -36,7 +56,266 @@ interface VaultEditorProps {
   onDeleteSelected: () => void;
 }
 
+interface WebsiteRowProps {
+  uriEntry: VaultDraft['loginUris'][number];
+  index: number;
+  canRemove: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  onUpdateUri: (index: number, value: string) => void;
+  onUpdateMatch: (index: number, value: number | null) => void;
+  onMove: (fromIndex: number, toIndex: number) => void;
+  onRemove: (index: number) => void;
+}
+
+const TOTP_QR_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+function WebsiteRow(props: WebsiteRowProps) {
+  const websiteMatchOptions = getWebsiteMatchOptions();
+
+  return (
+    <div className="website-row">
+      <div className="website-order-actions">
+        <button
+          type="button"
+          className="btn btn-secondary small website-order-btn"
+          title={t('txt_move_up')}
+          aria-label={t('txt_move_up')}
+          disabled={!props.canMoveUp}
+          onClick={() => props.onMove(props.index, props.index - 1)}
+        >
+          <ArrowUp size={14} className="btn-icon" />
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary small website-order-btn"
+          title={t('txt_move_down')}
+          aria-label={t('txt_move_down')}
+          disabled={!props.canMoveDown}
+          onClick={() => props.onMove(props.index, props.index + 1)}
+        >
+          <ArrowDown size={14} className="btn-icon" />
+        </button>
+      </div>
+      <input
+        className="input"
+        value={props.uriEntry.uri}
+        onInput={(e) => props.onUpdateUri(props.index, (e.currentTarget as HTMLInputElement).value)}
+      />
+      <select
+        className="input website-match-select"
+        value={props.uriEntry.match == null ? '' : String(props.uriEntry.match)}
+        onInput={(e) => {
+          const raw = (e.currentTarget as HTMLSelectElement).value;
+          props.onUpdateMatch(props.index, raw === '' ? null : Number(raw));
+        }}
+      >
+        {websiteMatchOptions.map((option) => (
+          <option key={`website-match-${String(option.value)}`} value={option.value == null ? '' : String(option.value)}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {props.canRemove && (
+        <button
+          type="button"
+          className="btn btn-secondary small website-remove-btn"
+          title={t('txt_remove')}
+          aria-label={t('txt_remove')}
+          onClick={() => props.onRemove(props.index)}
+        >
+          <X size={14} className="btn-icon" />
+          {t('txt_remove')}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function VaultEditor(props: VaultEditorProps) {
+  const createTypeOptions = getCreateTypeOptions();
+  const normalizedDraftCardBrand = normalizeCardBrand(props.draft.cardBrand);
+  const cardBrandOptions = normalizedDraftCardBrand && !CARD_BRAND_OPTIONS.includes(normalizedDraftCardBrand as any)
+    ? [...CARD_BRAND_OPTIONS, normalizedDraftCardBrand]
+    : CARD_BRAND_OPTIONS;
+  const totpQrVideoRef = useRef<HTMLVideoElement | null>(null);
+  const totpQrFileRef = useRef<HTMLInputElement | null>(null);
+  const totpQrStreamRef = useRef<MediaStream | null>(null);
+  const totpQrFrameRef = useRef<number | null>(null);
+  const [totpQrOpen, setTotpQrOpen] = useState(false);
+  const [totpQrStatus, setTotpQrStatus] = useState('');
+  const [totpQrBusy, setTotpQrBusy] = useState(false);
+  useDialogLifecycle(totpQrOpen, () => setTotpQrOpen(false));
+
+  const stopTotpQrScanner = () => {
+    if (totpQrFrameRef.current != null) {
+      window.cancelAnimationFrame(totpQrFrameRef.current);
+      totpQrFrameRef.current = null;
+    }
+    if (totpQrStreamRef.current) {
+      for (const track of totpQrStreamRef.current.getTracks()) track.stop();
+      totpQrStreamRef.current = null;
+    }
+    if (totpQrVideoRef.current) {
+      totpQrVideoRef.current.srcObject = null;
+    }
+  };
+
+  const applyTotpQrValue = (value: string) => {
+    const normalized = normalizeTotpInput(value);
+    if (!normalized) return false;
+    props.onUpdateDraft({ loginTotp: normalized });
+    setTotpQrStatus(t('txt_totp_qr_scanned'));
+    setTotpQrOpen(false);
+    return true;
+  };
+
+  const createTotpQrDetector = (): BarcodeDetector | null => {
+    if (typeof window === 'undefined' || !window.BarcodeDetector) return null;
+    return new window.BarcodeDetector({ formats: ['qr_code'] });
+  };
+
+  const decodeTotpQrCanvas = (source: ImageBitmap | HTMLVideoElement): string => {
+    const width = 'videoWidth' in source ? source.videoWidth : source.width;
+    const height = 'videoHeight' in source ? source.videoHeight : source.height;
+    if (!width || !height) return '';
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    if (!context) return '';
+    // jsQR ignores alpha and reads RGB directly, so transparent pixels would be
+    // treated as black. Composite over white first so transparent-background QR
+    // exports do not become black-on-black and fail to decode.
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, width, height);
+    context.drawImage(source, 0, 0, width, height);
+    const imageData = context.getImageData(0, 0, width, height);
+    return String(jsQR(imageData.data, width, height)?.data || '').trim();
+  };
+
+  const decodeTotpQrImage = async (source: ImageBitmap): Promise<boolean> => {
+    const detector = createTotpQrDetector();
+    if (detector) {
+      try {
+        const results = await detector.detect(source);
+        const value = String(results[0]?.rawValue || '').trim();
+        if (value && applyTotpQrValue(value)) return true;
+      } catch {
+        // Fall back to jsQR when the native detector is present but not usable.
+      }
+    }
+    const value = decodeTotpQrCanvas(source);
+    return value ? applyTotpQrValue(value) : false;
+  };
+
+  const handleTotpQrFile = async (file: File | null) => {
+    if (!file) return;
+    if (file.type && !file.type.startsWith('image/')) {
+      setTotpQrStatus(t('txt_totp_qr_invalid_image_type'));
+      return;
+    }
+    if (file.size > TOTP_QR_IMAGE_MAX_BYTES) {
+      setTotpQrStatus(t('txt_totp_qr_image_too_large'));
+      return;
+    }
+    setTotpQrBusy(true);
+    setTotpQrStatus(t('txt_totp_qr_scanning'));
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(file);
+      const found = await decodeTotpQrImage(bitmap);
+      if (!found) setTotpQrStatus(t('txt_totp_qr_not_found'));
+    } catch {
+      setTotpQrStatus(t('txt_totp_qr_scan_failed'));
+    } finally {
+      bitmap?.close();
+      setTotpQrBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!totpQrOpen) {
+      stopTotpQrScanner();
+      return;
+    }
+    let stopped = false;
+    let lastCanvasScan = 0;
+    const detector = createTotpQrDetector();
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setTotpQrStatus(t('txt_totp_qr_camera_unavailable'));
+      return () => {
+        stopped = true;
+        stopTotpQrScanner();
+      };
+    }
+
+    const scan = async () => {
+      if (stopped) return;
+      const video = totpQrVideoRef.current;
+      if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        totpQrFrameRef.current = window.requestAnimationFrame(scan);
+        return;
+      }
+      try {
+        let value = '';
+        if (detector) {
+          try {
+            const results = await detector.detect(video);
+            value = String(results[0]?.rawValue || '').trim();
+          } catch {
+            // Fall back to jsQR when the native detector is present but not usable.
+          }
+        }
+        // The jsQR fallback runs a synchronous full-frame decode, so throttle
+        // it to a few times per second instead of every animation frame to
+        // avoid pegging the CPU while a code is being aligned.
+        if (!value) {
+          const now = performance.now();
+          if (now - lastCanvasScan >= 250) {
+            lastCanvasScan = now;
+            value = decodeTotpQrCanvas(video);
+          }
+        }
+        if (value && applyTotpQrValue(value)) return;
+      } catch {
+        // Keep the camera active; transient frame decode failures are common.
+      }
+      totpQrFrameRef.current = window.requestAnimationFrame(scan);
+    };
+
+    setTotpQrBusy(true);
+    setTotpQrStatus(t('txt_totp_qr_starting_camera'));
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .then((stream) => {
+        if (stopped) {
+          for (const track of stream.getTracks()) track.stop();
+          return;
+        }
+        totpQrStreamRef.current = stream;
+        const video = totpQrVideoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        setTotpQrStatus(t('txt_totp_qr_point_camera'));
+        void video.play().then(() => {
+          setTotpQrBusy(false);
+          totpQrFrameRef.current = window.requestAnimationFrame(scan);
+        }).catch(() => {
+          setTotpQrBusy(false);
+          setTotpQrStatus(t('txt_totp_qr_camera_unavailable'));
+        });
+      })
+      .catch(() => {
+        setTotpQrBusy(false);
+        setTotpQrStatus(t('txt_totp_qr_camera_unavailable'));
+      });
+
+    return () => {
+      stopped = true;
+      stopTotpQrScanner();
+    };
+  }, [totpQrOpen]);
+
   const formatDownloadLabel = (attachmentId: string) => {
     const downloadKey = `${props.selectedCipher?.id || ''}:${attachmentId}`;
     if (props.downloadingAttachmentKey !== downloadKey) return t('txt_download');
@@ -51,6 +330,19 @@ export default function VaultEditor(props: VaultEditorProps) {
           name: props.uploadingAttachmentName || t('txt_attachment'),
           percent: props.attachmentUploadPercent,
         });
+
+  const addLoginUri = () => {
+    props.onUpdateDraft({ loginUris: [...props.draft.loginUris, createEmptyLoginUri()] });
+  };
+
+  const removeLoginUri = (index: number) => {
+    props.onUpdateDraft({ loginUris: props.draft.loginUris.filter((_, itemIndex) => itemIndex !== index) });
+  };
+
+  const moveLoginUri = (fromIndex: number, toIndex: number) => {
+    if (fromIndex < 0 || toIndex < 0 || fromIndex >= props.draft.loginUris.length || toIndex >= props.draft.loginUris.length || fromIndex === toIndex) return;
+    props.onReorderDraftLoginUri(fromIndex, toIndex);
+  };
 
   return (
     <>
@@ -75,7 +367,7 @@ export default function VaultEditor(props: VaultEditorProps) {
                 if (nextType === 5) props.onSeedSshDefaults();
               }}
             >
-              {CREATE_TYPE_OPTIONS.map((option) => (
+              {createTypeOptions.map((option) => (
                 <option key={option.type} value={option.type}>
                   {option.label}
                 </option>
@@ -115,25 +407,79 @@ export default function VaultEditor(props: VaultEditorProps) {
           </div>
           <label className="field">
             <span>{t('txt_totp_secret')}</span>
-            <input className="input" value={props.draft.loginTotp} onInput={(e) => props.onUpdateDraft({ loginTotp: (e.currentTarget as HTMLInputElement).value })} />
+            <div className="input-action-wrap">
+              <input className="input" value={props.draft.loginTotp} onInput={(e) => props.onUpdateDraft({ loginTotp: (e.currentTarget as HTMLInputElement).value })} />
+              <button
+                type="button"
+                className="input-icon-btn"
+                title={t('txt_scan_totp_qr')}
+                aria-label={t('txt_scan_totp_qr')}
+                disabled={props.busy}
+                onClick={() => {
+                  setTotpQrStatus('');
+                  setTotpQrOpen(true);
+                }}
+              >
+                <QrCode size={18} className="btn-icon" />
+              </button>
+            </div>
           </label>
           <div className="section-head">
             <h4>{t('txt_websites')}</h4>
-            <button type="button" className="btn btn-secondary small" onClick={() => props.onUpdateDraft({ loginUris: [...props.draft.loginUris, ''] })}>
+            <button type="button" className="btn btn-secondary small" onClick={addLoginUri}>
               <Plus size={14} className="btn-icon" /> {t('txt_add_website')}
             </button>
           </div>
-          {props.draft.loginUris.map((uri, index) => (
-            <div key={`uri-${index}`} className="website-row">
-              <input className="input" value={uri} onInput={(e) => props.onUpdateDraftLoginUri(index, (e.currentTarget as HTMLInputElement).value)} />
-              {props.draft.loginUris.length > 1 && (
-                <button type="button" className="btn btn-secondary small" onClick={() => props.onUpdateDraft({ loginUris: props.draft.loginUris.filter((_, i) => i !== index) })}>
-                  <X size={14} className="btn-icon" />
-                  {t('txt_remove')}
-                </button>
-              )}
-            </div>
+          {props.draft.loginUris.map((uriEntry, index) => (
+            <WebsiteRow
+              key={`uri-${index}`}
+              uriEntry={uriEntry}
+              index={index}
+              canMoveUp={index > 0}
+              canMoveDown={index < props.draft.loginUris.length - 1}
+              canRemove={props.draft.loginUris.length > 1}
+              onUpdateUri={props.onUpdateDraftLoginUri}
+              onUpdateMatch={props.onUpdateDraftLoginUriMatch}
+              onMove={moveLoginUri}
+              onRemove={removeLoginUri}
+            />
           ))}
+          {props.draft.loginFido2Credentials.length > 0 && (
+            <>
+              <div className="section-head passkeys-section-head">
+                <h4>{t('txt_passkeys')}</h4>
+              </div>
+              <div className="attachment-list">
+                {props.draft.loginFido2Credentials.map((credential, index) => {
+                  const createdAt = String(credential?.creationDate || '').trim();
+                  const label = createdAt
+                    ? t('txt_passkey_created_at_value', { value: formatHistoryTime(createdAt) })
+                    : t('txt_passkey');
+                  return (
+                    <div key={`login-passkey-${index}`} className="attachment-row">
+                      <div className="attachment-main">
+                        <div className="attachment-text">
+                          <strong>{t('txt_passkey')}</strong>
+                          <span>{label}</span>
+                        </div>
+                      </div>
+                      <div className="kv-actions">
+                        <button
+                          type="button"
+                          className="btn btn-secondary small"
+                          disabled={props.busy}
+                          onClick={() => props.onRequestDeleteLoginPasskey(index)}
+                        >
+                          <X size={14} className="btn-icon" />
+                          {t('txt_remove')}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -142,8 +488,37 @@ export default function VaultEditor(props: VaultEditorProps) {
           <h4>{t('txt_card_details')}</h4>
           <div className="field-grid">
             <label className="field"><span>{t('txt_cardholder_name')}</span><input className="input" value={props.draft.cardholderName} onInput={(e) => props.onUpdateDraft({ cardholderName: (e.currentTarget as HTMLInputElement).value })} /></label>
-            <label className="field"><span>{t('txt_number')}</span><input className="input" value={props.draft.cardNumber} onInput={(e) => props.onUpdateDraft({ cardNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
-            <label className="field"><span>{t('txt_brand')}</span><input className="input" value={props.draft.cardBrand} onInput={(e) => props.onUpdateDraft({ cardBrand: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field">
+              <span>{t('txt_number')}</span>
+              <input
+                className="input"
+                value={props.draft.cardNumber}
+                onInput={(e) => {
+                  const value = (e.currentTarget as HTMLInputElement).value;
+                  const detectedBrand = normalizeCardBrand(cardBrand(value) || '');
+                  props.onUpdateDraft({
+                    cardNumber: value,
+                    ...(props.draft.cardBrand ? {} : { cardBrand: detectedBrand }),
+                  });
+                }}
+              />
+            </label>
+            <label className="field">
+              <span>{t('txt_brand')}</span>
+              <div className="card-brand-select-row">
+                <CardBrandIcon brand={normalizedDraftCardBrand} />
+                <select
+                  className="input card-brand-select"
+                  value={normalizedDraftCardBrand}
+                  onInput={(e) => props.onUpdateDraft({ cardBrand: (e.currentTarget as HTMLSelectElement).value })}
+                >
+                  <option value="">{t('txt_select')}</option>
+                  {cardBrandOptions.map((brand) => (
+                    <option key={brand} value={brand}>{brand}</option>
+                  ))}
+                </select>
+              </div>
+            </label>
             <label className="field"><span>{t('txt_security_code_cvv')}</span><input className="input" value={props.draft.cardCode} onInput={(e) => props.onUpdateDraft({ cardCode: (e.currentTarget as HTMLInputElement).value })} /></label>
             <label className="field"><span>{t('txt_expiry_month')}</span><input className="input" value={props.draft.cardExpMonth} onInput={(e) => props.onUpdateDraft({ cardExpMonth: (e.currentTarget as HTMLInputElement).value })} /></label>
             <label className="field"><span>{t('txt_expiry_year')}</span><input className="input" value={props.draft.cardExpYear} onInput={(e) => props.onUpdateDraft({ cardExpYear: (e.currentTarget as HTMLInputElement).value })} /></label>
@@ -212,6 +587,64 @@ export default function VaultEditor(props: VaultEditorProps) {
             <span>{t('txt_fingerprint')}</span>
             <input className="input input-readonly" value={props.draft.sshFingerprint} readOnly />
           </label>
+        </div>
+      )}
+
+      {props.draft.type === 6 && (
+        <div className="card">
+          <h4>{t('txt_bank_account_details')}</h4>
+          <div className="field-grid">
+            <label className="field"><span>{t('txt_bank_name')}</span><input className="input" value={props.draft.bankName} onInput={(e) => props.onUpdateDraft({ bankName: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_name_on_account')}</span><input className="input" value={props.draft.bankNameOnAccount} onInput={(e) => props.onUpdateDraft({ bankNameOnAccount: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_account_type')}</span><input className="input" value={props.draft.bankAccountType} onInput={(e) => props.onUpdateDraft({ bankAccountType: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_account_number')}</span><input className="input" value={props.draft.bankAccountNumber} onInput={(e) => props.onUpdateDraft({ bankAccountNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_routing_number')}</span><input className="input" value={props.draft.bankRoutingNumber} onInput={(e) => props.onUpdateDraft({ bankRoutingNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_branch_number')}</span><input className="input" value={props.draft.bankBranchNumber} onInput={(e) => props.onUpdateDraft({ bankBranchNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_pin')}</span><input className="input" value={props.draft.bankPin} onInput={(e) => props.onUpdateDraft({ bankPin: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_swift_code')}</span><input className="input" value={props.draft.bankSwiftCode} onInput={(e) => props.onUpdateDraft({ bankSwiftCode: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_iban')}</span><input className="input" value={props.draft.bankIban} onInput={(e) => props.onUpdateDraft({ bankIban: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_bank_contact_phone')}</span><input className="input" value={props.draft.bankContactPhone} onInput={(e) => props.onUpdateDraft({ bankContactPhone: (e.currentTarget as HTMLInputElement).value })} /></label>
+          </div>
+        </div>
+      )}
+
+      {props.draft.type === 7 && (
+        <div className="card">
+          <h4>{t('txt_drivers_license_details')}</h4>
+          <div className="field-grid">
+            <label className="field"><span>{t('txt_first_name')}</span><input className="input" value={props.draft.licenseFirstName} onInput={(e) => props.onUpdateDraft({ licenseFirstName: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_middle_name')}</span><input className="input" value={props.draft.licenseMiddleName} onInput={(e) => props.onUpdateDraft({ licenseMiddleName: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_last_name')}</span><input className="input" value={props.draft.licenseLastName} onInput={(e) => props.onUpdateDraft({ licenseLastName: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_date_of_birth')}</span><input className="input" value={props.draft.licenseDateOfBirth} onInput={(e) => props.onUpdateDraft({ licenseDateOfBirth: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_license_number')}</span><input className="input" value={props.draft.licenseNumber} onInput={(e) => props.onUpdateDraft({ licenseNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issuing_country')}</span><input className="input" value={props.draft.licenseIssuingCountry} onInput={(e) => props.onUpdateDraft({ licenseIssuingCountry: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issuing_state')}</span><input className="input" value={props.draft.licenseIssuingState} onInput={(e) => props.onUpdateDraft({ licenseIssuingState: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issue_date')}</span><input className="input" value={props.draft.licenseIssueDate} onInput={(e) => props.onUpdateDraft({ licenseIssueDate: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_expiration_date')}</span><input className="input" value={props.draft.licenseExpirationDate} onInput={(e) => props.onUpdateDraft({ licenseExpirationDate: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issuing_authority')}</span><input className="input" value={props.draft.licenseIssuingAuthority} onInput={(e) => props.onUpdateDraft({ licenseIssuingAuthority: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_license_class')}</span><input className="input" value={props.draft.licenseClass} onInput={(e) => props.onUpdateDraft({ licenseClass: (e.currentTarget as HTMLInputElement).value })} /></label>
+          </div>
+        </div>
+      )}
+
+      {props.draft.type === 8 && (
+        <div className="card">
+          <h4>{t('txt_passport_details')}</h4>
+          <div className="field-grid">
+            <label className="field"><span>{t('txt_surname')}</span><input className="input" value={props.draft.passportSurname} onInput={(e) => props.onUpdateDraft({ passportSurname: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_given_name')}</span><input className="input" value={props.draft.passportGivenName} onInput={(e) => props.onUpdateDraft({ passportGivenName: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_date_of_birth')}</span><input className="input" value={props.draft.passportDateOfBirth} onInput={(e) => props.onUpdateDraft({ passportDateOfBirth: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_sex')}</span><input className="input" value={props.draft.passportSex} onInput={(e) => props.onUpdateDraft({ passportSex: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_birth_place')}</span><input className="input" value={props.draft.passportBirthPlace} onInput={(e) => props.onUpdateDraft({ passportBirthPlace: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_nationality')}</span><input className="input" value={props.draft.passportNationality} onInput={(e) => props.onUpdateDraft({ passportNationality: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issuing_country')}</span><input className="input" value={props.draft.passportIssuingCountry} onInput={(e) => props.onUpdateDraft({ passportIssuingCountry: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_passport_number')}</span><input className="input" value={props.draft.passportNumber} onInput={(e) => props.onUpdateDraft({ passportNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_passport_type')}</span><input className="input" value={props.draft.passportType} onInput={(e) => props.onUpdateDraft({ passportType: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_national_id_number')}</span><input className="input" value={props.draft.passportNationalIdentificationNumber} onInput={(e) => props.onUpdateDraft({ passportNationalIdentificationNumber: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issuing_authority')}</span><input className="input" value={props.draft.passportIssuingAuthority} onInput={(e) => props.onUpdateDraft({ passportIssuingAuthority: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_issue_date')}</span><input className="input" value={props.draft.passportIssueDate} onInput={(e) => props.onUpdateDraft({ passportIssueDate: (e.currentTarget as HTMLInputElement).value })} /></label>
+            <label className="field"><span>{t('txt_expiration_date')}</span><input className="input" value={props.draft.passportExpirationDate} onInput={(e) => props.onUpdateDraft({ passportExpirationDate: (e.currentTarget as HTMLInputElement).value })} /></label>
+          </div>
         </div>
       )}
 
@@ -322,23 +755,35 @@ export default function VaultEditor(props: VaultEditorProps) {
           .map((field, originalIndex) => ({ field, originalIndex }))
           .filter((entry) => entry.field.type !== 3)
           .map(({ field, originalIndex }) => (
-            <div key={`field-${originalIndex}`} className="uri-row">
-              <input className="input" value={field.label} onInput={(e) => props.onPatchDraftCustomField(originalIndex, { label: (e.currentTarget as HTMLInputElement).value })} />
-              {field.type === 2 ? (
-                <label className="check-line cf-check">
-                  <input
-                    type="checkbox"
-                    checked={toBooleanFieldValue(field.value)}
-                    onInput={(e) => props.onPatchDraftCustomField(originalIndex, { value: (e.currentTarget as HTMLInputElement).checked ? 'true' : 'false' })}
-                  />
-                </label>
-              ) : (
-                <input className="input" value={field.value} onInput={(e) => props.onPatchDraftCustomField(originalIndex, { value: (e.currentTarget as HTMLInputElement).value })} />
-              )}
-              <button type="button" className="btn btn-secondary small" onClick={() => props.onUpdateDraftCustomFields(props.draft.customFields.filter((_, i) => i !== originalIndex))}>
-                <X size={14} className="btn-icon" />
-                {t('txt_remove')}
-              </button>
+            <div key={`field-${originalIndex}`} className="custom-field-card">
+              <label className="field custom-field-label">
+                <span>{t('txt_field_label')}</span>
+                <input className="input" value={field.label} onInput={(e) => props.onPatchDraftCustomField(originalIndex, { label: (e.currentTarget as HTMLInputElement).value })} />
+              </label>
+              <div className="custom-field-body">
+                <div className="custom-field-value">
+                  {field.type === 2 ? (
+                    <label className="check-line cf-check custom-field-check">
+                      <input
+                        type="checkbox"
+                        checked={toBooleanFieldValue(field.value)}
+                        onInput={(e) => props.onPatchDraftCustomField(originalIndex, { value: (e.currentTarget as HTMLInputElement).checked ? 'true' : 'false' })}
+                      />
+                      <span>{toBooleanFieldValue(field.value) ? t('txt_checked') : t('txt_unchecked')}</span>
+                    </label>
+                  ) : (
+                    <textarea
+                      className="input textarea custom-field-textarea"
+                      value={field.value}
+                      onInput={(e) => props.onPatchDraftCustomField(originalIndex, { value: (e.currentTarget as HTMLTextAreaElement).value })}
+                    />
+                  )}
+                </div>
+                <button type="button" className="btn btn-secondary small custom-field-remove" onClick={() => props.onUpdateDraftCustomFields(props.draft.customFields.filter((_, i) => i !== originalIndex))}>
+                  <X size={14} className="btn-icon" />
+                  {t('txt_remove')}
+                </button>
+              </div>
             </div>
           ))}
       </div>
@@ -362,6 +807,52 @@ export default function VaultEditor(props: VaultEditorProps) {
         )}
       </div>
       {props.localError && <div className="local-error">{props.localError}</div>}
+      {totpQrOpen && typeof document !== 'undefined' ? createPortal((
+        <div className="dialog-mask totp-scan-mask open" onClick={(event) => event.target === event.currentTarget && setTotpQrOpen(false)}>
+          <section className="dialog-card totp-scan-dialog open" role="dialog" aria-modal="true" aria-label={t('txt_scan_totp_qr')}>
+            <div className="totp-scan-head">
+              <h3 className="dialog-title">{t('txt_scan_totp_qr')}</h3>
+              <button
+                type="button"
+                className="totp-scan-close"
+                onClick={() => setTotpQrOpen(false)}
+                title={t('txt_close')}
+                aria-label={t('txt_close')}
+              >
+                <X size={20} className="btn-icon" />
+              </button>
+            </div>
+            <div className="totp-scan-frame">
+              <video ref={totpQrVideoRef} className="totp-scan-video" muted playsInline />
+              <div className="totp-scan-corners" aria-hidden="true" />
+            </div>
+            <div className="totp-scan-footer">
+              <div className="dialog-message totp-scan-status">{totpQrStatus || t('txt_totp_qr_point_camera')}</div>
+              <div className="actions totp-scan-actions">
+                <button type="button" className="btn btn-secondary dialog-btn" disabled={totpQrBusy} onClick={() => totpQrFileRef.current?.click()}>
+                  <Upload size={14} className="btn-icon" />
+                  {t('txt_totp_qr_choose_image')}
+                </button>
+                <button type="button" className="btn btn-primary dialog-btn" onClick={() => setTotpQrOpen(false)}>
+                  <X size={14} className="btn-icon" />
+                  {t('txt_close')}
+                </button>
+              </div>
+            </div>
+            <input
+              ref={totpQrFileRef}
+              type="file"
+              accept="image/*"
+              className="attachment-file-input"
+              onChange={(event) => {
+                const input = event.currentTarget as HTMLInputElement;
+                void handleTotpQrFile(input.files?.[0] || null);
+                input.value = '';
+              }}
+            />
+          </section>
+        </div>
+      ), document.body) : null}
     </>
   );
 }
